@@ -1,0 +1,212 @@
+####### Test Data Sheet with Baseline along with recursive search    ########
+
+
+import os
+import pandas as pd
+from docx import Document
+from docx.shared import RGBColor
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from PyPDF2 import PdfReader
+import re
+import difflib
+
+# ----------------- Extract Table from Word -----------------
+def extract_table_after_heading(docx_path, heading_text):
+    doc = Document(docx_path)
+    all_elements = list(doc.element.body.iterchildren())
+    found_heading = False
+
+    for element in all_elements:
+        if element.tag.endswith('p'):
+            para = Paragraph(element, doc)
+            para_text = para.text.strip()
+            style = para.style.name if para.style else ""
+            if para_text == heading_text.strip() and style.startswith("Heading"):
+                found_heading = True
+                continue
+
+        if found_heading and element.tag.endswith('tbl'):
+            table = Table(element, doc)
+            rows_data = []
+
+            for row in table.rows:
+                row_data = [cell.text.strip() for cell in row.cells]
+                rows_data.append(row_data)
+
+            if not rows_data:
+                return pd.DataFrame()
+
+            header = rows_data[0]
+            num_cols = len(header)
+            clean_rows = []
+
+            for row in rows_data[1:]:
+                if len(row) < num_cols:
+                    row += [""] * (num_cols - len(row))
+                elif len(row) > num_cols:
+                    row = row[:num_cols]
+                clean_rows.append(row)
+
+            df = pd.DataFrame(clean_rows, columns=header)
+
+            # Normalize column names
+            df.rename(columns={
+                'Test Procedure Name Or Activity': 'Test Procedure Name',
+                'DOORS View or Test Activity': 'Test Procedure View',
+                'Test Folder': 'Test Folder Number',
+                'Test Procedure Section(s)': 'Section(s) Performed'
+            }, inplace=True)
+
+            # Add Baseline column
+            df["Baseline"] = None
+            return df
+    return None
+
+# ----------------- Extract Baseline from PDFs -----------------
+def extract_baseline_from_pdf(pdf_path):
+    try:
+        reader = PdfReader(pdf_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+
+        # Regex: capture only until end of line
+        match = re.search(r"Baseline\s*[:\-]?\s*(.+)", text, re.IGNORECASE)
+        if match:
+            baseline_line = match.group(1).strip()
+            # Take only the first token before newline
+            baseline_value = baseline_line.splitlines()[0].strip()
+            return baseline_value
+    except Exception as e:
+        print(f"Error reading PDF {pdf_path}: {e}")
+    return None
+
+# ----------------- Match PDF filename recursively -----------------
+def find_matching_pdf(test_name, pdf_dir):
+    pdf_files = []
+
+    # Walk through all subdirectories
+    for root, dirs, files in os.walk(pdf_dir):
+        for f in files:
+            if f.lower().endswith(".pdf"):
+                pdf_files.append(os.path.join(root, f))
+
+    # Exact match first
+    for pdf in pdf_files:
+        if test_name.lower() in os.path.basename(pdf).lower():
+            return pdf
+
+    # Fuzzy match as fallback
+    close_matches = difflib.get_close_matches(
+        test_name,
+        [os.path.basename(f) for f in pdf_files],
+        n=1,
+        cutoff=0.6
+    )
+    if close_matches:
+        # Map back to full path
+        for pdf in pdf_files:
+            if os.path.basename(pdf) == close_matches[0]:
+                return pdf
+
+    return None
+
+# ----------------- Fill Word Template -----------------
+def fill_word_template(df, template_path, output_dir, special_field, pdf_dir):
+    os.makedirs(output_dir, exist_ok=True)
+
+    for idx, row in df.iterrows():
+        doc = Document(template_path)
+
+        # Try to get Baseline value from matching PDF
+        pdf_path = find_matching_pdf(str(row["Test Procedure Name"]), pdf_dir)
+        baseline_text = None
+        if pdf_path:
+            baseline_text = extract_baseline_from_pdf(pdf_path)
+            if baseline_text:
+                df.at[idx, "Baseline"] = baseline_text  # save into dataframe
+
+        for table in doc.tables:
+            num_rows = len(table.rows)
+            num_cols = len(table.rows[0].cells) if num_rows > 0 else 0
+
+            for r in range(num_rows):
+                for c in range(num_cols):
+                    cell = table.cell(r, c)
+
+                    # Handle Baseline separately
+                    if "Baseline" in cell.text and baseline_text:
+                        cell.text = ""
+                        para = cell.paragraphs[0]
+
+                        # Baseline label: black + bold
+                        run_label = para.add_run("Baseline: ")
+                        run_label.bold = True
+                        run_label.font.color.rgb = RGBColor(0, 0, 0)
+
+                        # Value: blue, normal (no italic/bold)
+                        run_value = para.add_run(baseline_text)
+                        run_value.font.color.rgb = RGBColor(0, 0, 255)
+                        run_value.bold = False
+                        run_value.italic = False
+                        continue
+
+                    # Fill other fields
+                    for key in df.columns:
+                        if key in cell.text:
+                            if key == special_field:
+                                if r + 1 < num_rows:
+                                    target_cell = table.cell(r + 1, c)
+                                    target_cell.text = ""
+                                    run = target_cell.paragraphs[0].add_run(str(row[key]))
+                                    run.font.color.rgb = RGBColor(0, 0, 255)
+                            else:
+                                for para in cell.paragraphs:
+                                    if key in para.text:
+                                        parts = para.text.split(":", 1)
+                                        if len(parts) > 1:
+                                            new_value = str(row[key])
+                                            before_colon = True
+                                            for run in para.runs:
+                                                if before_colon:
+                                                    if ":" in run.text:
+                                                        colon_index = run.text.index(":") + 1
+                                                        run.text = run.text[:colon_index]
+                                                        new_run = para.add_run(f" {new_value}")
+                                                        new_run.font.color.rgb = RGBColor(0, 0, 255)
+                                                        new_run.bold = False
+                                                        new_run.italic = False
+                                                        before_colon = False
+                                                else:
+                                                    run.text = ""
+
+        # Filename
+        first_val = str(row.iloc[0]).replace("/", "-").replace("\\", "-")
+        second_val = str(row.iloc[1]).replace("/", "-").replace("\\", "-")
+        third_val = str(row.iloc[2]).replace("/", "-").replace("\\", "-")
+        filename = f"{first_val}_{second_val}_{third_val}.docx"
+        filepath = os.path.join(output_dir, filename)
+
+        doc.save(filepath)
+
+    print(f"Documents saved in: {output_dir}")
+    return df
+
+# ----------------- Workflow -----------------
+df = extract_table_after_heading(
+    docx_path="C:\\Users\\320160242\\Documents\\VM14.0\\TestDataSheetAutomation\\13.0Plan.docx",
+    heading_text="Addenda"
+)
+
+if df is not None and not df.empty:
+    df = fill_word_template(
+        df=df,
+        template_path="C:\\Users\\320160242\\Documents\\VM14.0\\TestDataSheetAutomation\\TestDataSheet.docx",
+        output_dir="C:\\Users\\320160242\\Documents\\VM14.0\\TestDataSheetAutomation\\output2",
+        special_field="Section(s) Performed",
+        pdf_dir="C:\\Users\\320160242\\Documents\\VM14.0\\TestDataSheetAutomation\\ProtocolsFinal"
+    )
+
+else:
+    print("No data found after the given heading.")
